@@ -1,0 +1,1176 @@
+---
+title: "STA330_ScRNA_PBMCs_10xGenomics"
+author: "Duy Nguyen, Minh Nguyen, Hannah Kim"
+date: "2025-02-05"
+output: pdf_document
+---
+
+### 0) General Notes
+
+scRNA-Seq enables high-resolution, genome-wide profiling of RNA molecules in individual
+cells. A primary application is assessing transcriptional similarities and differences 
+within cell populations, revealing significant heterogeneity in contexts such as embryonic
+and immune cells. This heterogeneity analysis remains central to scRNA-Seq studies. In 
+addition, scRNA-Seq helps identify rare cell populations - e.g., malignant tumor cells 
+within a tumor mass or hyper-responsive immune cells—that would be undetectable in bulk 
+analyses. 
+
+Beyond cellular heterogeneity, scRNA-Seq provides insights into gene expression 
+fundamentals, including monoallelic expression, splicing patterns, and transcriptional 
+noise. It can also identify co-regulated gene modules and infer gene-regulatory networks 
+that drive functional heterogeneity and cell-type specification.
+
+However, the level of detail scRNA-Seq provides depends on the specific protocol used.
+
+The general procedure for a scRNA-Seq experiment
+
+1. Experimental procedure
+
+- Isolate single cells from a tissue sample
+
+- Single cell lysis in a way that preserve the cellular mRNA
+
+- mRNA molecule captures using poly-T sequence primers that bind to mRNA poly-A
+tails 
+
+- Convert the poly-T-primed mRNA into cDNA using reverse transcription
+
+- cDNA amplification via PCR or in vitro transcription 
+
+- cDNA sequencing library preparation 
+
+- Pool cDNA sequencing libraries 
+
+- Sequencing via NGS
+
+Haque et al. (2017). https://genomemedicine.biomedcentral.com/articles/10.1186/s13073-017-0467-4#citeas
+
+2. Computational procedure (Depending on the package used)
+
+This procedure is based on the Seurat package and the outputs from 10xGenomics.
+This pipeline is adapted from the tutorial by Dr. Zhisong He and Prof. Barbara 
+Treutlein at: https://github.com/quadbio/scRNAseq_analysis_vignette
+
+- Import the package 
+
+- Create the Seurat object by combining the 3 output files 
+
+- Quality control
+
+- Normalization 
+
+- Feature selection for heterogeneity analysis 
+
+- Scaling 
+
+- Linear dimension reduction: Principal Component Analysis (PCA)
+
+- Non-linear dimension reduction: t-distributed Stochastic Neighbor Embedding (t-SNE) and Uniform Manifold Approximation and Projection (UMAP) 
+
+- Cell clustering and annotation
+
+
+### 1) Project set up
+
+```{r}
+### Set working directory
+setwd("/Users/manhduynguyen/STA330_ScRNA-Seq_PBMCs_10xGenomics")
+```
+
+```{r, eval = F}
+### Install required packages
+install.packages("leiden")
+install.packages("Seurat")
+install.packages("Matrix")
+install.packages("patchwork")
+```
+
+```{r}
+### Load packages
+library("leiden")
+library("Seurat")
+library("Matrix")
+library("ggplot2")
+library("patchwork")
+library("tidyverse")
+
+if (!require("scCATCH")) {
+  remotes::install_github("ZJUFanLab/scCATCH")
+  library(scCATCH)
+}
+
+### List all loaded packages
+(.packages())
+```
+
+### 2) Import datasets from 10xGenomics and create Seurat object
+
+```{r}
+### Import the raw scRNA-Seq data
+# Expression matrix in sparse format
+counts <- readMM("Raw Data/matrix.mtx.gz")
+# Cell barcodes
+barcodes <- read.table("Raw Data/barcodes.tsv.gz", 
+                       stringsAsFactors = F) [,1]
+# Gene features
+features <- read.csv("Raw Data/features.tsv.gz", 
+                     stringsAsFactors = F, 
+                     sep = "\t", 
+                     header = F)
+
+### Check the structure of each imported file
+str(counts)
+str(barcodes)
+str(features)
+
+### Set gene features as row names and cell barcodes as column names
+rownames(counts) <- make.unique(features[,2]) # Make sure that gene names are unique to eliminate duplicates
+colnames(counts) <- barcodes
+
+### Create Seurat object
+
+# dgTMatrix (Triplet Matrix): A sparse matrix format that stores the matrix as a list
+# of its non-zero values, along with their row and column indices. There are 3 components
+# of values, row indices, and column indices
+
+# dgCMatrix (Compressed Sparse Column Matrix): A sparse matrix that stores the matrix in 
+# column-compressed form. The matrix is represented by 3 arrays of values, row indices
+# of the values, and column pointers.
+
+seurat <- CreateSeuratObject(counts, 
+                             project = "5K_Mouse")
+
+### Add mitochondrial content percentage as a new metadata column
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, 
+                                               pattern = "^MT-|^mt-|^Mt-")
+
+### Check the distribution
+# Count per cell
+summary(seurat[["nCount_RNA"]])
+# Genes detected per cell
+summary(seurat[["nFeature_RNA"]])
+# Mitochondrial percentages
+summary(seurat[["percent.mt"]])
+
+### Check for NA values in each column of the metadata
+### There should not be any NA (return value of 0)
+sum(is.na(seurat@meta.data$nFeature_RNA))     
+sum(is.na(seurat@meta.data$nCount_RNA))       
+sum(is.na(seurat@meta.data$percent.mt))      
+
+### Since there are 261743 NA values in the mitochondrial percentages, these NAs 
+### should be removed
+# Filter rows with NAs in either one of the three columns
+filtered_meta_data <- seurat@meta.data %>%
+  filter(!is.na(nFeature_RNA) & !is.na(nCount_RNA) & !is.na(percent.mt))
+
+# Subset seurat object to only retain rows without NAs 
+seurat_noNA <- subset(seurat, cells = rownames(filtered_meta_data))
+
+# Make sure that there is no NAs in the column for mitochondrial percentages
+sum(is.na(seurat_noNA@meta.data$percent.mt))
+
+### Check the distribution again
+### There should not be any NA (return value of 0)
+# Count per cell
+summary(seurat_noNA@meta.data$nCount_RNA)
+# Genes detected per cell
+summary(seurat_noNA@meta.data$nFeature_RNA)
+# Mitochondrial percentages
+summary(seurat_noNA@meta.data$percent.mt)
+
+### nCount_RNA: The range is from 1 to 92216, with a median of 1 and a mean of 123.5, 
+### suggesting that many cells are at the lower end of the scale, which is unusual 
+### for single-cell RNA-seq data and might suggest low-quality cells.
+
+### nFeature_RNA: The range is from 1 to 7825 features, with a median of 1 and a 
+### mean of 41.31. suggesting that many cells have very few features detected, which 
+### could be a sign of poor-quality or empty droplets.
+
+### percent.mt: The minimum is 0, but the maximum is 100, suggesting that some cells 
+### with a very high mitochondrial content, which is often associated with damaged 
+### cells or dead cells.
+
+### Create a violin plot with each point as an individual cell
+# png("Plot_Violin__nCount_nFeature_percent.mt.png", res = 300, width = 8, height = 5, units = "in")
+VlnPlot(seurat_noNA, features = c("nCount_RNA",
+                                  "nFeature_RNA", 
+                                  "percent.mt"), 
+        ncol = 3)
+# dev.off()
+
+### Scatter plot to examine the relationship between RNA transcript count and 
+### mitochondrial percentages
+plot_scatter_nCountRNA_percentmt <- FeatureScatter(seurat_noNA, 
+                                                   feature1 = "nCount_RNA", 
+                                                   feature2 = "percent.mt",
+                                                   raster = T)
+
+plot_scatter_nCountRNA_percentmt + 
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black")
+
+### Scatter plot to examine the relationship between RNA transcript count and 
+### genes detected
+plot_scatter_nCountRNA_nFeatureRNA <- FeatureScatter(seurat_noNA, 
+                                                     feature1 = "nCount_RNA", 
+                                                     feature2 = "nFeature_RNA",
+                                                     raster = T)
+
+plot_scatter_nCountRNA_nFeatureRNA + 
+  geom_hline(yintercept = 500, linetype = "dashed", color = "black") + 
+  geom_hline(yintercept = 5000, linetype = "dashed", color = "black")
+
+### Combine the 2 scatter plots
+# png("Plot_Relationship_nCount_nFeature_percent.mt.png", res = 300, width = 12, height = 5, units = "in")
+plot_scatter_nCountRNA_percentmt + plot_scatter_nCountRNA_nFeatureRNA
+# dev.off()
+
+### As expected, the number of detected genes and the number of detected transcripts
+### are correlated while the mitochondrial transcript percentage is not
+```
+
+### 3) Quality Controls
+
+The most common quality control is to filter out:
+
+1. Cells with too few detected genes: These cells are not sequenced deep enough for
+reliable characterization.
+
+2. Cells with too many detected genes: These cells may represent doublets or multiplets 
+(i.e., two or more cells in the same droplets, therefore sharing the same barcode).
+
+3. Cells with high mitochrondrial transcript percentages: These cells may represent
+cells under stress (e.g., hypoxia) which produce a lot of mitochondria or high amount
+of truncated mitochondrial transcripts.
+
+As most of the scRNA-Seq experiments use oligo-T to capture mRNAs, mitochondrial 
+transcripts should be relatively under-represented due to their lack of poly-A tails, 
+but it is unavoidable that some mitochondrial transcripts are captured. There is 
+also evidence that stable poly-A tails exist in some mitochondrial transcripts but 
+serve as a marker for degradation. 
+
+```{r}
+### Filter out cells with detected genes between 500 and 5000, and mitochondrial 
+### percentage lower than 5%
+seurat_noNA_filtered_1 <- subset(seurat_noNA, 
+                                nFeature_RNA > 500 & nFeature_RNA < 5000 & percent.mt < 5)
+nrow(seurat_noNA_filtered_1@meta.data)
+### Sometimes other thresholds and more quality controls need to be performed 
+
+### Maybe a different number of detected genes (brains can range up to 12000 or as low as 200)
+```
+
+The tutorial from bioconductor with unfiltered 10xGenomics PBMCs only uses percent.mt
+to filter out damage cells using median absolute deviation.
+
+Oelen, R., de Vries, D. H., Brugge, et al. (2022). Single-cell RNA-sequencing of 
+peripheral blood mononuclear cells reveals widespread, context-specific gene expression 
+regulation upon pathogenic exposure. Nature Communications, 13(1). https://doi.org/10.1038/s41467-022-30893-5 
+
+Oelen et al. (2022) suggests the cut-off threshold to be over 200 genes detected 
+and mitochondiral percentage lower than 8% and 15% based on their batches.
+
+```{r}
+### Filter out cells with detected genes > 200, and mitochondrial percentage 
+### lower than 8%
+seurat_noNA_filtered_2 <- subset(seurat_noNA,
+                                 nFeature_RNA > 200 & percent.mt < 5)
+nrow(seurat_noNA_filtered_2@meta.data)
+
+### Filter out cells with detected genes > 100
+seurat_noNA_filtered_3 <- subset(seurat_noNA,
+                                 nFeature_RNA > 100)
+nrow(seurat_noNA_filtered_3@meta.data)
+
+### Filter out cells with detected genes > 100, and mitochondrial percentage 
+### lower than 5%
+seurat_noNA_filtered_4 <- subset(seurat_noNA,
+                                 nFeature_RNA > 100 & percent.mt < 5)
+nrow(seurat_noNA_filtered_4@meta.data)
+```
+
+We decided to proceed with the initial thresholds of detected genes between 500 and 5000,
+and mitochondrial percentage lower than 5% since the number of remaining cells aligns
+with the results from the 10xGenomics pipeline (https://cf.10xgenomics.com/samples/cell-vdj/9.0.0/5k_Mouse_PBMCs_5p_gem-x_5k_Mouse_PBMCs_5p_gem-x/5k_Mouse_PBMCs_5p_gem-x_5k_Mouse_PBMCs_5p_gem-x_web_summary.html).
+
+Xie, X., Liu, M., Zhang, Y., et al. (2020). Single-cell transcriptomic landscape of 
+human blood cells. National Science Review, 8(3). https://doi.org/10.1093/nsr/nwaa180 
+
+Stankiewicz, A. M., Goscik, J., Swiergiel, A. H., et al. (2014). Social stress increases 
+expression of hemoglobin genes in mouse prefrontal cortex. BMC Neuroscience, 15(1). https://doi.org/10.1186/s12868-014-0130-6 
+
+Xie et al. (2020) & Stankiewicz et al. (2014) suggest the marker genes for RBCs/erythrocytes: 
+Hbb-b1, Hbb-b2, Hba-a1, Hba-a2, hbd, hbg, Beta-S, Alas2, Mgp, Gata1, Klf1, Klf3
+
+```{r}
+### Check for the potential presence of RBCs
+
+# Define RBC-related genes
+rbc_genes <- c("Hbb", "Hba1", "Hba2", "Hbd", "Gata1", "Klf1", "Klf3", 
+               "Hbb-b1", "Hbb-b2", "Hba-a1", "Hba-a2", "hbd", "hbg", 
+               "Beta-S", "Alas2", "Mgp")
+
+# Extract gene names from the metadata of the filtered seurat 
+genes_names_after_filtered_1 <- rownames(seurat_noNA_filtered_1)
+
+# Check which RBC genes are present
+genes_present <- rbc_genes %in% genes_names_after_filtered_1
+print(genes_present)
+```
+
+### 4) Normalization
+
+The amount of captured RNA is different from cell to cell. Therefore, it should be
+avoided to directly compare the number of captured transcript for each gene between
+cells. A normalization step, aiming to make gene expression levels between different 
+cells comparable, is necessary.
+
+The most commonly used normalization in scRNA-Seq analysis is to normalize the 
+feature expression measurements for each cell to the total expression, and then
+multiplies this by a scale factor or 10000 by default. The resulting expression 
+levels are log-transformed so that the expression values better fit a normal 
+distribution.
+
+It is worth to mention that before doing the log-transformation, a pseudocount is 
+added to every value so that genes with 0 transcripts detected in a cell still present
+with value of 0 after log-transform.
+
+Normalized Expression = log10(UMI counts/Total counts per cell*10^4 + 1)
+
+```{r}
+### Normalize the expression levels of all features
+seurat_normalized_1 <- NormalizeData(seurat_noNA_filtered_1)
+
+### Before normalization
+
+# Extract the raw UMI count from the metadata as matrix before normalization
+counts_matrix <- as.matrix(GetAssayData(seurat_noNA_filtered_1, layer = "counts"))
+
+# Convert the raw count matrix into a numeric vector for visualization 
+counts_vector <- as.numeric(counts_matrix)  
+
+# Create the histogram of log-transformed raw UMI counts to assess data distribution
+# The (log10(UMI counts + 1)) is the pseudocount for better interpretation
+# png("Plot_hist_before_normalization.png", res = 300, width = 8, height = 5, units = "in")
+hist(log10(counts_vector + 1), 
+     breaks = 100, 
+     main = "Before Normalization", 
+     xlab = "log10(UMI counts + 1)")
+# dev.off()
+
+# png("Plot_hist_before_normalization_without_pseudo.png", res = 300, width = 8, height = 5, units = "in")
+hist(log10(counts_vector), 
+     breaks = 100, 
+     main = "Before Normalization without Pseudocount", 
+     xlab = "log10(UMI counts)")
+# dev.off()
+
+### After normalization
+
+# Extract the raw UMI count from the metadata as matrix after normalization
+# The "data" layer stores the log-normalized counts
+normalized_matrix <- as.matrix(GetAssayData(seurat_normalized_1, layer = "data"))
+
+# Convert the normalized count matrix into a numeric vector for visualization 
+normalized_vector <- as.numeric(normalized_matrix)  # Convert to numeric vector
+
+# Create the histogram of log-transformed normalized UMI counts to assess data distribution
+# The (log10(UMI counts + 1)) is the pseudocount for better interpretation
+# png("Plot_hist_after_normalization.png", res = 300, width = 8, height = 5, units = "in")
+hist(log10(normalized_vector + 1), 
+     breaks = 100, 
+     main = "After Normalization", 
+     xlab = "log10(Normalized counts + 1)")
+# dev.off()
+
+# png("Plot_hist_after_normalization_without_pseudo.png", res = 300, width = 8, height = 5, units = "in")
+hist(log10(normalized_vector), 
+     breaks = 100, 
+     main = "After Normalization", 
+     xlab = "log10(Normalized counts)")
+# dev.off()
+```
+
+
+In scRNA-seq analysis, genes with zero counts in some or even most cells are not 
+immediately removed during normalization. This is because:
+
+1. Zero Counts May Be Due to Dropout Events
+scRNA-seq data is highly sparse, meaning some genes are not detected even if they 
+are actually expressed due to technical limitations (e.g., low capture efficiency).
+Keeping these genes allows normalization methods to account for dropout events properly.
+
+2. Some Genes Are Expressed in Only a Few Cells
+A gene might have zero expression in most cells but be highly expressed in a rare 
+cell type (e.g., a marker gene for a specific cell population). If removed prematurely, 
+important cell-type-specific information could be lost.
+
+3. Normalization Adjusts for Technical Variability
+Normalization methods (like `NormalizeData()` in Seurat) scale gene expression 
+relative to total counts per cell, ensuring fair comparison between genes.
+Removing zero-expressed genes beforehand could bias this scaling process.
+
+### 5) Feature Selection for Heterogeneity Analysis
+
+The advantage of single-cell compared to bulk RNA-Seq is the potential to look into
+cellular heterogeneity of samples, by identifying cell groups with distinct molecular 
+signatures. However, not every gene has the same level of  information and the same
+contribution when trying to identify different cell groups.
+
+Therefore, it is necessary to perform a proper feature selection before further exploration.
+
+```{r}
+### Identify highly variable features/genes (genes with the most varied expression
+### levels across cells)
+
+# Top 5000 features
+seurat_featurevariable_1 <- FindVariableFeatures(seurat_normalized_1,
+                                                 nfeatures = 5000)
+```
+
+By default, Seurat calculates the standardized variance of each gene across cells,
+and pick the top ones as the highly variable features. There is no good criteria to 
+determine how many highly variable features to use. Sometimes it might require a few
+iterations to pick the number that gives the clearest for interpretation. A value 
+between 2000 and 5000 should be good enough.
+
+```{r}
+### Extract the top 20 features that are highly variable
+top_20_features <- head(VariableFeatures(seurat_featurevariable_1), 20)
+print(top_20_features)
+
+### Plot the variable features 
+
+# Create a scatter plot of feature variance to visualize the distribution of variable 
+# genes across dataset
+plot_topfeatures_1 <- VariableFeaturePlot(seurat_featurevariable_1)
+
+# Annotate the top 20 variables on the scatter plot
+plot_topfeatures_anno_1 <- LabelPoints(plot = plot_topfeatures_1, 
+                                       points = top_20_features,
+                                       repel = T,
+                                       xnudge = 0,
+                                       max.overlaps = 25)
+
+# png("Plot_featureselection.png", res = 300, width = 8, height = 5, units = "in")
+plot_topfeatures_anno_1
+# dev.off()
+```
+
+
+### 5) Data Scaling
+
+Since different genes have different base expression levels and distributions,
+the contribution of each gene to the analysis is different if no data transformation
+is performed. These highly expressed genes/features would dominate the dimension 
+reduction techniques in the later steps of the analysis. Therefore, we have to scale 
+the data with the selected features.
+
+The scaling is performed using z-score normalization on the log-normalized data,
+so that the expression of each gene centers around 0, with an SD of 1. 
+
+Scaled Expression = (Normalized Expression - Mean of Normalized Expression)/SD of Normalize Expression
+
+During this step, it is possible to remove unwanted sources of variation from 
+the dataset such as nFeature_RNA/nCount_RNA, percent.mt, or the cell cycle related 
+variables.
+
+A common suggestion is to not perform any removal in the first iteration of data
+exploration but to check the results first and if any unwanted source of variation
+dominates cellular heterogeneity, try to regress out the respective variable and see
+whether the result improves.
+
+```{r}
+### Normalize the data using selected features
+seurat_scaled_1 <- ScaleData(seurat_featurevariable_1)
+```
+
+
+```{r}
+### Create plot for expression distribution to compare the log-normalized data and the scaled data
+
+# Get top 3 variable genes 
+top_variable_genes <- head(VariableFeatures(seurat_scaled_1), 3)
+
+# Extract log-normalized and scaled expression values for filtered genes
+normalized_data <- GetAssayData(seurat_scaled_1, slot = "data")[top_variable_genes, ]
+scaled_data <- GetAssayData(seurat_scaled_1, slot = "scale.data")[top_variable_genes, ]
+
+# Extract the log-normalized expression values for these genes
+normalized_data <- GetAssayData(seurat_scaled_1, slot = "data")[top_variable_genes, ]
+
+# Extract the scaled expression values for these genes
+scaled_data <- GetAssayData(seurat_scaled_1, slot = "scale.data")[top_variable_genes, ]
+
+# Create an empty list to store the plots
+plot_list <- list()
+
+# Loop through each top variable gene/feature for density plots
+for (gene in top_variable_genes) {
+  # Create a data frame of log-normalized and scaled expression values fro each gene 
+  df <- data.frame(
+    Expression = c(normalized_data[gene, ], scaled_data[gene, ]),
+    Type = rep(c("Log-Normalized", "Scaled"), each = ncol(normalized_data)),
+    Gene = gene
+  )
+  
+  # Create the density plots based on the extracted expression values
+  plot_list[[gene]] <- ggplot(df, aes(x = Expression, fill = Type)) +
+    geom_density(alpha = 0.7) +
+    labs(y = "Density", 
+         title = gene) +
+    theme_minimal()
+}
+
+# Combine and display the plots
+# png("Plot_scale_top3variablegene.png", res = 300, width = 8, height = 5, units = "in")
+wrap_plots(plot_list, ncol = 1) +
+  plot_annotation(title = "Expression Distribution Before vs After Scaling")
+# dev.off()
+
+# Compared the log-normalized and scaled data for the expression of the top 3 variable genes
+summary(as.vector(GetAssayData(seurat_scaled_1, slot = "data")["S100a9", ]))
+summary(as.vector(GetAssayData(seurat_scaled_1, slot = "scale.data")["S100a9", ]))
+
+summary(as.vector(GetAssayData(seurat_scaled_1, slot = "data")["S100a8", ]))
+summary(as.vector(GetAssayData(seurat_scaled_1, slot = "scale.data")["S100a8", ]))
+
+summary(as.vector(GetAssayData(seurat_scaled_1, slot = "data")["Igkv6-15", ]))
+summary(as.vector(GetAssayData(seurat_scaled_1, slot = "scale.data")["Igkv6-15", ]))
+```
+
+Log-normalized data:
+
+- Data have many 0s, especially for sparse genes 
+
+- The mean is > 0, due to a small number of cells with high expression pulling it up
+
+- The median and quartiles are 0 as most cells do not express genes
+
+This distribution is not symmetric and not centered around 0, as expected of log-normalized
+data
+
+Scaled data:
+
+- The mean is centered at 0 
+
+- Since there are so many 0s that all of the quartiles have the same negative z-scores
+
+The sparse nature cause the scaled data to be extremely right skewed
+
+### 6) Principal Component Analysis (PCA)
+
+Cell heterogeneity can be described after identifying highly variable genes and 
+scaling the data. However, applying a linear dimension reduction with PCA is recommended
+as:
+
+1. The data become more compact so the computation becomes faster
+
+2. As scRNA-Seq data is intrinsically sparse, summarizing the measurements of related
+features greatly enhances the signal robustness
+
+The number of PCs that can be calculated for a dataset is equal to the number of highly 
+variable features/genes or the number of cells, whichever value is smaller. However,
+most of these PCs are not informative and only represent random noise. Only the top
+PCs are informative and represent differences among cell populations. Therefore, instead
+of calculating all possible PCs, Seurat uses truncated PCA to only calculate the first 
+50 PCs by default. 
+
+In order to pick the optimal number of PCs, we can use the elbow plot. Higher ranked PCs
+(have higher standard deviations) explain more variation in the data than lower-ranked 
+PCs. However, the decrease in standard deviation is not linear. The curve of the elbow
+plot drops dramatically for the first few PCs and slowly flatten out. This would assume 
+that the first phase of the curve represents the real signal related to biological 
+differences between cell populations, while the second phase represents mostly technical
+variation or the stochastic nature of individual cells.
+
+In addition, we can also check which genes are mostly contributing to each of the 
+top PCs. This can be informative if we know the genes and the biology of the analyzed
+samples. It provides the opportunity to understand the biological implication of each
+of the top PCs
+
+```{r}
+### Perform the default PCA with 50 first PCs
+seurat_pca_1 <- RunPCA(seurat_scaled_1, npcs = 50)
+
+### Visualize the PCA using scatter plot
+DimPlot(seurat_pca_1, reduction = "pca")
+
+### Create the elbow plot to identify the optimal number of PCs
+# png("Plot_PCElbow.png", res = 300, width = 8, height = 5, units = "in")
+ElbowPlot(seurat_pca_1, ndims = ncol(Embeddings(seurat_pca_1, "pca")))
+# dev.off()
+
+# The optimal PCs seems to be 10
+
+### Check the top 10 PCs with heatmap
+# png("Plot_PCHeatmap.png", res = 300, width = 8, height = 5, units = "in")
+PCHeatmap(seurat_pca_1, 
+          dims = 1:10, 
+          cells = 500, 
+          balanced = T,
+          ncol = 5)
+# dev.off()
+```
+
+It is not recommended to choose only PCs represented by "interesting" genes. For 
+most of the data, a PC number from 10 to 50 would be reasonable.
+
+### 7) t-distributed Stochastic Neighbor embedding (t-SNE) and Uniform Manifold Approximation and Projection (UMAP)
+
+Both methods perform non-linear dimensional reduction, aiming to map each cell 
+into a lower-dimensional space (2D/3D) while preserving the original distances or 
+neighborhood relationships as accurately as possible.
+
+Both methods have their pros and cons and neither always work better than the other.
+t-SNE provides great visualization when cells form distinct cell groups while UMAP
+preserves trajectory-like structure better when data contain "continuum" (e.g. the 
+continuous cell state change during development and differentiation) 
+
+```{r}
+### Perform t-SNE and UMAP
+
+# The top PCs from the PCA are used as input to create the t-SNE and UMAP embedding 
+# of the data 
+seurat_tSNE_1 <- RunTSNE(seurat_pca_1, dims = 1:10)
+seurat_UMAP_1 <- RunUMAP(seurat_pca_1, dims = 1:10)
+
+# Create a scatter plot of the t-SNE and UMAP embeddings
+plot_tSNE <- TSNEPlot(seurat_tSNE_1)
+plot_UMAP <- UMAPPlot(seurat_UMAP_1)
+
+# Display both plots side by side for comparison 
+# png("Plot_tSNE_nocluster.png", res = 300, width = 8, height = 5, units = "in")
+plot_tSNE
+# dev.off()
+
+# png("Plot_UMAP_nocluster.png", res = 300, width = 8, height = 5, units = "in")
+plot_UMAP
+# dev.off()
+```
+
+Once t-SNE and UMAP embedding is created, we can start checking whether certain 
+cell types or cell states exist in the data by doing feature plots of some known
+canonical markers of the cell types of interest
+
+```{r}
+### Visualize the expression of marker genes on the t-SNE and UMAP embedding
+
+### Known marker genes
+# T-cells: Cd4, Cd8a, Cd8b, Cd3e
+# B-cells: Cd19, Cd79a, Cd79b
+# Natural killer cells: Ncam1 (Cd56), Klrd1 (Cd94)
+# Monocytes: Cd14, Fcgr3a (Cd16)
+
+# t-SNE
+plot_tSNE_genes <- FeaturePlot(seurat_tSNE_1, c("Cd4", "Cd8a", "Cd3e", "Cd19", 
+                                                "Cd79a", "Cd79b", "Ncam1", "Krld1", 
+                                                "Cd14", "Fcgr3a"),
+                               ncol = 4, 
+                               reduction = "tsne")
+
+# UMAP
+plot_UMAP_genes <- FeaturePlot(seurat_UMAP_1, c("Cd4", "Cd8a", "Cd3e", "Cd19", 
+                                                "Cd79a", "Cd79b", "Ncam1", "Krld1", 
+                                                "Cd14", "Fcgr3a"),
+                               ncol = 4, 
+                               reduction = "umap")
+
+# Display both plots side by side for comparison
+# png("Plot_tSNE_genes.png", res = 300, width = 14, height = 5, units = "in")
+plot_tSNE_genes
+# dev.off()
+
+# png("Plot_UMAP_genes.png", res = 300, width = 14, height = 5, units = "in")
+plot_UMAP_genes
+# dev.off()
+```
+
+### 8) Cell Clustering
+
+Creating feature plot of known markers is usually a good way to start with when 
+exploring scRNA-seq data. However, to more comprehensively understand the underlying 
+heterogeneity in the data, it is necessary to identify cell groups with an unbiased 
+manner, resulting in the use of clustering. 
+
+(t-SNE/UMAP only provide visualization of high-dimensional data in 2D, clustering 
+provides a quantitative identification of distinct cell population)
+
+In theory, any clustering methods can be used, including those widely used in bulk 
+RNA-seq data analysis such as hierarchical clustering and k-means. However, in practice, 
+this is very difficult, as the sample size in scRNA-seq data is much larger (one 
+10x experiment usually gives several thousands of cells). It would be extremely 
+slow to use these methods. In addition, due to the intrinsic sparseness of scRNA-seq 
+data, even if data is denoised by dimension reduction like PCA, differences between 
+different cells are not as well quantitative as those of bulk RNA-seq data. Therefore, 
+the more commonly used clustering methods in scRNA-seq data analysis is graph-based 
+community identification algorithm. 
+
+First, a k-nearest neighbor (kNN) network of cells is constructed. Each cell is 
+initially connected to its closest neighbors based on their PC values. Only pairs 
+of cells that are mutual neighbors are considered connected. The proportion of 
+shared neighbors between each cell pair is then calculated to determine the strength 
+of their connection, with weak connections being pruned. The result is a Shared 
+Nearest Neighbor (SNN) network.
+
+Once the network is built, the Louvain community detection algorithm is applied 
+to identify clusters within the network. This algorithm groups cells into communities 
+where intra-cluster connections are dense, while inter-cluster connections are sparse, 
+effectively identifying biologically relevant cell populations.
+
+
+```{r}
+### Perform clustering and visualize on t-SNE/UMAP embedding
+
+# Construct kNN graph 
+seurat_tSNE_neighbor_1 <- FindNeighbors(seurat_tSNE_1, dims = 1:10)
+
+# Cluster cells using Louvain algorithm 
+seurat_tSNE_cluster_1 <- FindClusters(seurat_tSNE_neighbor_1, resolution = 1)
+
+# Visual the clusters on t-SNE embedding 
+plot_tSNE_cluster_1 <- DimPlot(seurat_tSNE_cluster_1, reduction = "tsne", label = T)
+
+# Construct kNN graph 
+seurat_UMAP_neighbor_1 <- FindNeighbors(seurat_UMAP_1, dims = 1:10)
+
+# Cluster cells using Louvain algorithm 
+seurat_UMAP_cluster_1 <- FindClusters(seurat_UMAP_neighbor_1, resolution = 1)
+
+# Visual the clusters on UMAP embedding 
+plot_UMAP_cluster_1 <- DimPlot(seurat_UMAP_cluster_1, reduction = "umap", label = T)
+
+# Display both plots side by side for comparison
+plot_tSNE_cluster_1 + plot_UMAP_cluster_1
+
+png("Plot_tSNE_cluster.png", res = 300, width = 14, height = 5, units = "in")
+plot_tSNE_cluster_1
+dev.off()
+
+png("Plot_UMAP_cluster.png", res = 300, width = 14, height = 5, units = "in")
+plot_UMAP_cluster_1
+dev.off()
+```
+
+The `resolution` parameter in `FindClusters()` determines the granularity of clustering. 
+A lower resolution (e.g., 0.1) yields larger, coarse-grained clusters, representing 
+broad cell types, while a higher resolution (e.g., 1) produces smaller, more refined 
+clusters, capturing finer cell subtypes. Commonly used values range between 0.1 and 1, 
+depending on the dataset and desired clustering detail.
+
+
+### 9) Cluster Annotation
+
+After clustering, cluster annotation assigns biological identities to each cluster.
+This process involves several integrated steps
+
+- Identify marker genes that are significantly enriched in each cluster
+(`FindAllMarkers()` function performs differential expression analysis with Wilcoxon's
+rank sum test between cells in the cluster and cells in other clusters. Due to the intrinsic
+larger sample size in scRNA-Seq data, with one cell as one sample, it is strongly recommended
+to not look at only p-value, but also the minimum detection rate of the gene in the cluster
+`min.pct` and the log fold change between cells in and outside the cluster `logfc.threshold`)
+
+In the context of scRNA-seq, differential expression analysis (e.g., using the Wilcoxon 
+rank sum test) compares the distribution of gene expression levels for each gene in 
+the cluster of interest against the distribution in cells from other clusters, as 
+determined by the prior clustering step. This helps identify marker genes that are 
+significantly more (or less) expressed in a given cluster compared to others.
+
+- Compare the identified cluster markers to curated reference datasets (e.g. CellMatch)
+to determine the overlap between the cluster marker genes and known cell type marker
+genes
+
+- Automatically predict the preliminary cell type annotations based on the overlapping 
+marker genes using the `scCATCH` package
+
+- Create a curated list of key marker genes from references and identify the the gene 
+expression pattern of these marker genes across all clusters
+
+- Manually adjusted the preliminary cell type annotations based on the gene expression 
+patterns using the curated marker genes
+
+- Visualize the cell type annotations on the t-SNE and UMAP embeddings
+
+```{r}
+# Define a function to analyze markers that overlap with reference genes
+analyze_cluster_markers <- function(object) {
+  # Extract all unique cluster ID from the "markergene" slot of the object 
+  clusters <- unique(object@markergene$cluster)
+  
+  # Loop through each cluster to compare the marker genes and reference genes 
+  for (cluster_id in clusters) {
+    # Get unique marker genes for the current cluster 
+    cluster_markers <- unique(object@markergene$gene[object@markergene$cluster == cluster_id])
+    
+    # Find the overlapping genes between the marker genes and reference genes in the current cluster
+    overlapping_genes <- intersect(cluster_markers, unique(object@marker$gene))
+    
+    # Print the cluster ID
+    cat(paste0("\nCluster: ", cluster_id, "\n"))
+    
+    # Print the number of marker genes in the cluster
+    cat(paste0("  Number of marker genes: ", length(cluster_markers), "\n"))
+    
+    # Print the number of overlapping genes
+    cat(paste0("  Number of overlapping genes with reference: ", length(overlapping_genes), "\n"))
+    
+    # If there are overlapping genes, print the first 10; otherwise, state that no overlaps were found 
+    if (length(overlapping_genes) > 0) {
+      cat("  Overlapping genes (first 10):\n")
+      print(head(overlapping_genes, 10))
+    } else {
+      cat("  No overlapping genes found with the reference.\n")
+    }
+  }
+}
+
+### t-SNE
+
+# Identify top markers per cluster
+sc_tSNE_markers <- FindAllMarkers(
+  seurat_tSNE_cluster_1,
+  assay = "RNA",
+  only.pos = TRUE,
+  min.pct = 0.25,        # Detection rate the gene in the cluster
+  logfc.threshold = 0.5, # The fold change between cells in and out the cluster
+  test.use = "wilcox"
+)
+
+# Check the top 2 marker genes per cluster based on avg_log2FC
+sc_tSNE_marker_top <- sc_tSNE_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 2) %>%
+  as.data.frame()
+
+# Create scCATCH object using raw counts and cluster IDs
+sc_tSNE_obj <- createscCATCH(
+  data = seurat_tSNE_cluster_1@assays$RNA$counts, # Lost dimnames when use seurat_tSNE_cluster_1@assays$RNA@layers$counts
+  cluster = as.character(Idents(seurat_tSNE_cluster_1))
+)
+
+# Add marker genes and reference database based on the species and tissue types
+data("cellmatch")  
+sc_tSNE_obj@markergene <- sc_tSNE_markers
+sc_tSNE_obj@marker <- cellmatch[cellmatch$species == "Mouse" &
+                                cellmatch$tissue %in% c("Peripheral blood", "Blood"), ]
+
+# Analyze markers overlapping with the reference genes
+analyze_cluster_markers(sc_tSNE_obj)
+
+# Predict cell types 
+sc_tSNE_obj <- findcelltype(sc_tSNE_obj)
+
+# Check the predicted cell types with scores
+sc_tSNE_obj@celltype %>%
+  select(cluster, cell_type, celltype_score)
+
+
+### UMAP
+
+# Identify top markers per cluster
+sc_UMAP_markers <- FindAllMarkers(
+  seurat_UMAP_cluster_1,
+  assay = "RNA",
+  only.pos = TRUE,
+  min.pct = 0.25,         # Detection rate the gene in the cluster
+  logfc.threshold = 0.5,  # The fold change between cells in and out the cluster
+  test.use = "wilcox"
+)
+
+# Check the top 2 marker genes per cluster based on avg_log2FC
+sc_UMAP_marker_top <- sc_UMAP_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 2) %>%
+  as.data.frame()
+
+# Create scCATCH object using raw counts and cluster IDs
+sc_UMAP_obj <- createscCATCH(
+  data = seurat_UMAP_cluster_1@assays$RNA$counts, # Lost dimnames when use seurat_UMAP_cluster_1@assays$RNA@layers$counts
+  cluster = as.character(Idents(seurat_UMAP_cluster_1))
+)
+
+# Add marker genes and reference database based on the species and tissue types
+data("cellmatch")  
+sc_UMAP_obj@markergene <- sc_UMAP_markers
+sc_UMAP_obj@marker <- cellmatch[cellmatch$species == "Mouse" &
+                                cellmatch$tissue %in% c("Peripheral blood", "Blood"), ]
+
+# Analyze markers overlapping with the reference genes
+analyze_cluster_markers(sc_UMAP_obj)
+
+# Predict cell types 
+sc_UMAP_obj <- findcelltype(sc_UMAP_obj)
+
+# Check the predicted cell types with scores
+sc_UMAP_obj@celltype %>%
+  select(cluster, cell_type, celltype_score)
+```
+
+The curated marker gene list is created based on these references: 
+
+Hackert, N. S., Radtke, F. A., Exner, T., et al. (2023). Human and mouse neutrophils 
+share core transcriptional programs in both homeostatic and inflamed contexts. 
+Nature Communications, 14(1). https://doi.org/10.1038/s41467-023-43573-9 
+
+Miyake, K., Ito, J., Nakabayashi, J., Shichino, S., Ishiwata, K., & Karasuyama, H. (2023). 
+Single cell transcriptomics clarifies the Basophil differentiation trajectory and identifies pre-basophils upstream of mature basophils. Nature Communications, 14(1). https://doi.org/10.1038/s41467-023-38356-1 
+
+Wang, Z., Xie, L., Ding, G., et al. (2021). Single-cell RNA sequencing of peripheral 
+blood mononuclear cells from Acute Kawasaki Disease patients. Nature Communications, 12(1). https://doi.org/10.1038/s41467-021-25771-5 
+
+```{r}
+# Define the curated cell type markers
+curated_markers <- list()
+curated_markers[["T-cells"]] <- c("Cd3d", "Cd3e", "Cd3g")
+curated_markers[["CD4+ T-cells"]] <- c("Cd4")
+curated_markers[["CD8+ T-cells"]] <- c("Cd8a", "Cd8b")
+curated_markers[["NK-cells"]] <- c("Ncam1", "Klrb1", "Nkg7")
+curated_markers[["B-cells"]] <- c("Cd19", "Ms4a1", "Cd38")
+curated_markers[["Monocytes"]] <- c("Cd14", "Cd68", "Cd16")
+curated_markers[["Neutrophil"]] <- c("Csf3r", "Cxcr2", "Ncf4", "Junb")
+curated_markers[["Basophil"]] <- c("Fcer1a", "Clec12a", "Cd9", "Itga2")
+curated_markers[["mDCs"]] <- c("Cd1c") # Myeloid dendritic cells
+curated_markers[["pDCs"]] <- c("Lilra4") # Plasmacytoid dendritic cells 
+curated_markers[["HSPCs"]] <- c("Cd34") # Hematopoietic stem and progenitor cells 
+curated_markers[["Erythrocytes"]] <- c("Hba-a1", "Hba-a2", "Hbb-b1", "Hbb-b2")
+curated_markers[["Megakaryocytes"]] <- c("Ppbp")
+
+# Create dot plot for the expression level of each curated gene in each cluster 
+sc_tSNE_markers_dotplot <- DotPlot(seurat_tSNE_cluster_1, 
+                              features = curated_markers, 
+                              assay = 'RNA') +
+  theme(text = element_text(size=10), 
+        axis.text.x = element_text(angle = 45, vjust = 0.5))
+
+
+sc_UMAP_markers_dotplot <- DotPlot(seurat_UMAP_cluster_1, 
+                              features = curated_markers, 
+                              assay = 'RNA') +
+  theme(text = element_text(size=10), 
+        axis.text.x = element_text(angle = 45, vjust = 0.5))
+
+
+# Display the plots
+# These two should be similar
+# png("Plot_tSNE_markergenes_expression.png", res = 300, width = 24, height = 5, units = "in")
+sc_tSNE_markers_dotplot
+# dev.off()
+
+# png("Plot_UMAP_markergenes_expression.png", res = 300, width = 24, height = 5, units = "in")
+sc_UMAP_markers_dotplot
+# dev.off()
+
+# Genes not found: Cd8b, Cd16, Cd1c, Lilra4, Hbb-b1, Hbb-b2
+
+# Based on these gene patterns
+# Cluster 3: CD8+ => CD4+
+# Cluster 7: Stem cell => Unknown 1
+# Cluster 8: HSPCs => Unknown 2
+# Cluster 9: Regulatory => CD4+
+# Cluster 11: CD8+ => NK
+# Cluster 12: Regulatory => Unknown 3
+# Cluster 14: Basophil => Basophil/Neutrophil
+# Cluster 15: Platelet => Basophil/Megakaryocyte
+
+### t-SNE
+
+# Create a new dataframe for cell type annotation
+sc_tSNE_anno <- sc_tSNE_obj@celltype %>%
+  select(cluster, cell_type) %>%
+  mutate(cluster = factor(cluster, levels = c(0:15))) %>%
+  arrange(cluster)
+
+# Check the new dataframe
+sc_tSNE_anno
+
+# Update the annotations for cell cluster based on the dot plot and scCATCH results
+sc_tSNE_anno$cell_type[c(4,10)] <- "CD4+ T Cell"
+sc_tSNE_anno$cell_type[c(8)] <- "Unknown 1"
+sc_tSNE_anno$cell_type[c(9)] <- "Unknown 2"
+sc_tSNE_anno$cell_type[c(12)] <- "Natural Killer Cell"
+sc_tSNE_anno$cell_type[c(13)] <- "Unknown 3"
+sc_tSNE_anno$cell_type[c(15)] <- "Basophil/Neutrophil"
+sc_tSNE_anno$cell_type[c(16)] <- "Basophil/Megakaryocyte"
+
+# Extract the meta data from the seurat object
+old_tSNE_metadata <- seurat_tSNE_cluster_1@meta.data
+
+# Combine the cell type annotation into the meta data 
+new_tSNE_metadata <- old_tSNE_metadata %>%
+  left_join(sc_tSNE_anno, by = c("seurat_clusters" = "cluster"))
+
+# Retain the original row names 
+rownames(new_tSNE_metadata) <- rownames(seurat_tSNE_cluster_1@meta.data)
+
+# Import the new meta data to the seurat object 
+seurat_tSNE_cluster_1@meta.data <- new_tSNE_metadata
+
+# Create the new t-SNE plot with cluster annotations
+sc_tSNE_dimplot <- DimPlot(seurat_tSNE_cluster_1, 
+                           group.by = "cell_type", 
+                           reduction = "tsne",
+                           label = T) +
+  theme(text = element_text(size = 10))
+
+### UMAP
+
+# Create a new dataframe for cell type annotation
+sc_UMAP_anno <- sc_UMAP_obj@celltype %>%
+  select(cluster, cell_type) %>%
+  mutate(cluster = factor(cluster, levels = c(0:15))) %>%
+  arrange(cluster)
+
+# Check the new dataframe
+sc_UMAP_anno
+
+# Update the annotations for cell cluster based on the dot plot and scCATCH results
+sc_UMAP_anno$cell_type[c(4,10)] <- "CD4+ T Cell"
+sc_UMAP_anno$cell_type[c(8)] <- "Unknown 1"
+sc_UMAP_anno$cell_type[c(9)] <- "Unknown 2"
+sc_UMAP_anno$cell_type[c(12)] <- "Natural Killer Cell"
+sc_UMAP_anno$cell_type[c(13)] <- "Unknown 3"
+sc_UMAP_anno$cell_type[c(15)] <- "Basophil/Neutrophil"
+sc_UMAP_anno$cell_type[c(16)] <- "Basophil/Megakaryocyte"
+
+# Extract the meta data from the seurat object
+old_UMAP_metadata <- seurat_UMAP_cluster_1@meta.data
+
+# Combine the cell type annotation into the meta data 
+new_UMAP_metadata <- old_UMAP_metadata %>%
+  left_join(sc_UMAP_anno, by = c("seurat_clusters" = "cluster"))
+
+# Retain the original row names 
+rownames(new_UMAP_metadata) <- rownames(seurat_UMAP_cluster_1@meta.data)
+
+# Import the new meta data to the seurat object 
+seurat_UMAP_cluster_1@meta.data <- new_UMAP_metadata
+
+# Create the new t-SNE plot with cluster annotations
+sc_UMAP_dimplot <- DimPlot(seurat_UMAP_cluster_1, 
+                           group.by = "cell_type", 
+                           reduction = "umap",
+                           label = T) +
+  theme(text = element_text(size = 10))
+
+# Display the plots
+png("Plot_tSNE_final.png", res = 300, width = 14, height = 5, units = "in")
+sc_tSNE_dimplot
+dev.off()
+
+png("Plot_UMAP_final.png", res = 300, width = 14, height = 5, units = "in")
+sc_UMAP_dimplot
+dev.off()
+
+```
+
+### 10) Integration into the meta-analysis project of chronic social defeat stress
+
+```{r}
+### Visualize the downregulated genes in both UMAP and tSNE 
+
+# Sin3a, Tmem223, Tecr, Wipi2, Cd37, Gne, Mtss1, Wdr24, Npepl1, Pssmd7, Vars1, Rlig1
+# Fxn, Akip1, Gcn1, Oard1, Ints11, Phf13, H2-Ab1, Fcho1, Gtf3c2, Isoc2b, Cep164
+
+
+eli_plot_tSNE_down_genes <- FeaturePlot(seurat_tSNE_1, c("Sin3a", "Tmem223", "Tecr", "Wipi2", 
+                                                         "Cd37", "Gne", "Mtss1", "Wdr24", 
+                                                         "Npepl1", "Pssmd7", "Vars1", "Rlig1",
+                                                         "Fxn", "Akip1", "Gcn1", "Oard1",
+                                                         "Ints11", "Phf13", "H2-Ab1",
+                                                         "Fcho1", "Gtf3c2", "Isoc2b", "Cep164"),
+                                                         ncol = 4, 
+                                                         reduction = "tsne")
+
+eli_plot_tSNE_down_genes
+
+eli_plot_UMAP_down_genes <- FeaturePlot(seurat_UMAP_1, c("Sin3a", "Tmem223", "Tecr", "Wipi2", 
+                                                         "Cd37", "Gne", "Mtss1", "Wdr24", 
+                                                         "Npepl1", "Pssmd7", "Vars1", "Rlig1",
+                                                         "Fxn", "Akip1", "Gcn1", "Oard1",
+                                                         "Ints11", "Phf13", "H2-Ab1",
+                                                         "Fcho1", "Gtf3c2", "Isoc2b", "Cep164"),
+                                                          ncol = 4, 
+                                                          reduction = "umap")
+
+eli_plot_UMAP_down_genes
+
+### Visualize the upregulated genes in both UMAP and tSNE 
+
+# St3gal5, Anks1b, Otos, Stradb, Guca2a, Cyp2e1, 4933411K16Rik?, Stip1, Pxmp2, Gpatch8
+# Isg20, Rhbdl1, C1ql2, Nol4l, Scgb1a1, Arf5
+
+eli_plot_tSNE_up_genes <- FeaturePlot(seurat_tSNE_1, c("St3gal5", "Anks1b", "Otos", "Stradb", 
+                                                       "Guca2a", "Cyp2e1", "4933411K16Rik", 
+                                                       "Stip1", "Pxmp2", "Gpatch8", "Isg20", "Rhbdl1",
+                                                        "C1ql2", "Nol4l", "Scgb1a1", "Arf5"),
+                                                        ncol = 4, 
+                                                        reduction = "tsne")
+
+eli_plot_tSNE_up_genes
+
+eli_plot_UMAP_up_genes <- FeaturePlot(seurat_UMAP_1, c("St3gal5", "Anks1b", "Otos", "Stradb", 
+                                                       "Guca2a", "Cyp2e1", "4933411K16Rik", 
+                                                       "Stip1", "Pxmp2", "Gpatch8", "Isg20", "Rhbdl1",
+                                                       "C1ql2", "Nol4l", "Scgb1a1", "Arf5"),
+                                                       ncol = 4, 
+                                                       reduction = "umap")
+
+eli_plot_UMAP_up_genes
+
+
+### Create a list of genes of interest
+
+downregulate_genes <- c("Sin3a", "Tmem223", "Tecr", "Wipi2", "Cd37", "Gne", "Mtss1", "Wdr24", 
+                        "Npepl1", "Pssmd7", "Vars1", "Rlig1", "Fxn", "Akip1", "Gcn1", "Oard1",
+                        "Ints11", "Phf13", "H2-Ab1", "Fcho1", "Gtf3c2", "Isoc2b", "Cep164")
+
+upregulate_genes <- c("St3gal5", "Anks1b", "Otos", "Stradb", "Guca2a", "Cyp2e1",
+                      "4933411K16Rik", "Stip1", "Pxmp2", "Gpatch8", "Isg20", "Rhbdl1",
+                      "C1ql2", "Nol4l", "Scgb1a1", "Arf5")
+
+### Check if the interested genes are available in the original meta data 
+setdiff(downregulate_genes,
+        rownames(seurat_UMAP_cluster_1))
+# Genes not found Pssmd7, Vars1, Rlig1
+
+setdiff(upregulate_genes,
+        rownames(seurat_UMAP_cluster_1))
+# All genes found
+
+# However, most of the these genes are not in the feature variables for scaling 
+# (Only the top 5000 most variable features are included)
+
+### Create the heatmaps with available genes
+DoHeatmap(subset(seurat_UMAP_cluster_1, downsample = 100), 
+          features = downregulate_genes, 
+          group.by = "cell_type",
+          size = 3)
+
+DoHeatmap(subset(seurat_UMAP_cluster_1, downsample = 100), 
+          features = upregulate_genes, 
+          group.by = "cell_type",
+          size = 3)
+
+# Combine the 2 lists of genes together 
+eli_gene_of_interest <- union(downregulate_genes, upregulate_genes)
+
+# Check if the genes of interest are available
+eli_gene_of_interest <- intersect(eli_gene_of_interest, rownames(seurat_normalized_1))
+
+# Scale these genes of interests instead of the top 5000 variable features
+eli_seurat_UMAP_cluster <- ScaleData(seurat_normalized_1, features = eli_gene_of_interest)
+
+# Check if the cell barcodes match between the two objects
+identical(colnames(eli_seurat_UMAP_cluster), colnames(seurat_UMAP_cluster_1))
+# This should return TRUE
+
+# Copy the cell_type annotation over from the UMAP object for heatmap
+eli_seurat_UMAP_cluster@meta.data$cell_type <- seurat_UMAP_cluster_1@meta.data$cell_type
+
+# Create the heatmap with these genes of interest
+DoHeatmap(eli_seurat_UMAP_cluster,
+          features = eli_gene_of_interest,
+          group.by = "cell_type",
+          size = 3)
+```
